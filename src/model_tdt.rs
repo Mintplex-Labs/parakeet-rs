@@ -64,6 +64,7 @@ impl ParakeetTDTModel {
         let candidates = [
             "encoder-model.onnx",
             "encoder.onnx",
+            "encoder-model.fp16.onnx",
             "encoder-model.int8.onnx",
         ];
         for candidate in &candidates {
@@ -92,6 +93,7 @@ impl ParakeetTDTModel {
     fn find_decoder_joint(dir: &Path) -> Result<PathBuf> {
         let candidates = [
             "decoder_joint-model.onnx",
+            "decoder_joint-model.fp16.onnx",
             "decoder_joint-model.int8.onnx",
             "decoder_joint.onnx",
             "decoder-model.onnx",
@@ -100,6 +102,17 @@ impl ParakeetTDTModel {
             let path = dir.join(candidate);
             if path.exists() {
                 return Ok(path);
+            }
+        }
+        // fallback
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                    if name.starts_with("decoder_joint") && name.ends_with(".onnx") {
+                        return Ok(path);
+                    }
+                }
             }
         }
         Err(Error::Config(format!(
