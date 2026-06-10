@@ -67,7 +67,20 @@ impl ParakeetTDT {
         let vocab = Vocabulary::from_file(&vocab_path)?;
         let vocab_size = vocab.size();
 
-        let model = ParakeetTDTModel::from_pretrained(path, exec_config, vocab_size)?;
+        let mut model = ParakeetTDTModel::from_pretrained(path, exec_config, vocab_size)?;
+
+        // Load static_config.json for NPU fixed-frame models
+        let static_config_path = path.join("static_config.json");
+        if static_config_path.exists() {
+            if let Ok(data) = std::fs::read_to_string(&static_config_path) {
+                if let Ok(sc) = serde_json::from_str::<serde_json::Value>(&data) {
+                    if let Some(frames) = sc.get("fixed_frames").and_then(|v| v.as_u64()) {
+                        model.set_fixed_frames(frames as usize);
+                    }
+                }
+            }
+        }
+
         let decoder = ParakeetTDTDecoder::from_vocab(vocab);
         let feature_cache = FeatureCache::from_config(&preprocessor_config);
 

@@ -8,12 +8,16 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone)]
 pub struct TDTModelConfig {
     pub vocab_size: usize,
+    /// Fixed mel frame count for static-shape models (NPU). When set, encoder
+    /// input is zero-padded to this size and the actual frame count is passed
+    /// via the length input.
+    pub fixed_frames: Option<usize>,
 }
 
 impl TDTModelConfig {
     /// Create config with specified vocab size
     pub fn new(vocab_size: usize) -> Self {
-        Self { vocab_size }
+        Self { vocab_size, fixed_frames: None }
     }
 }
 
@@ -37,21 +41,64 @@ impl ParakeetTDTModel {
     ) -> Result<Self> {
         let model_dir = model_dir.as_ref();
 
-        // Find encoder and decoder_joint files
         let encoder_path = Self::find_encoder(model_dir)?;
         let decoder_joint_path = Self::find_decoder_joint(model_dir)?;
 
         let config = TDTModelConfig::new(vocab_size);
 
-        // Load encoder
-        let builder = Session::builder()?;
-        let mut builder = exec_config.apply_to_session_builder(builder)?;
-        let encoder = builder.commit_from_file(&encoder_path)?;
+        let (encoder, decoder_joint) = if let Some(ref cache_dir) = exec_config.ep_context_cache_dir {
+            std::fs::create_dir_all(cache_dir).ok();
+            let enc_ctx = cache_dir.join(Self::ctx_filename(&encoder_path));
+            let dec_ctx = cache_dir.join(Self::ctx_filename(&decoder_joint_path));
 
-        // Load decoder_joint
-        let builder = Session::builder()?;
-        let mut builder = exec_config.apply_to_session_builder(builder)?;
-        let decoder_joint = builder.commit_from_file(&decoder_joint_path)?;
+            if enc_ctx.exists() && dec_ctx.exists() {
+                // Fast path: load pre-compiled context models
+                let encoder = {
+                    let builder = Session::builder()?;
+                    let mut builder = exec_config.apply_to_session_builder(builder)?;
+                    builder.commit_from_file(&enc_ctx)?
+                };
+                let decoder_joint = {
+                    let builder = Session::builder()?;
+                    let mut builder = exec_config.apply_to_session_builder(builder)?;
+                    builder.commit_from_file(&dec_ctx)?
+                };
+                (encoder, decoder_joint)
+            } else {
+                // Slow path: compile and dump context models for next time
+                let encoder = {
+                    let builder = Session::builder()?;
+                    let mut builder = exec_config.apply_to_session_builder(builder)?;
+                    builder = builder
+                        .with_config_entry("ep.context_enable", "1")?
+                        .with_config_entry("ep.context_file_path", enc_ctx.to_string_lossy().as_ref())?
+                        .with_config_entry("ep.context_embed_mode", "1")?;
+                    builder.commit_from_file(&encoder_path)?
+                };
+                let decoder_joint = {
+                    let builder = Session::builder()?;
+                    let mut builder = exec_config.apply_to_session_builder(builder)?;
+                    builder = builder
+                        .with_config_entry("ep.context_enable", "1")?
+                        .with_config_entry("ep.context_file_path", dec_ctx.to_string_lossy().as_ref())?
+                        .with_config_entry("ep.context_embed_mode", "1")?;
+                    builder.commit_from_file(&decoder_joint_path)?
+                };
+                (encoder, decoder_joint)
+            }
+        } else {
+            let encoder = {
+                let builder = Session::builder()?;
+                let mut builder = exec_config.apply_to_session_builder(builder)?;
+                builder.commit_from_file(&encoder_path)?
+            };
+            let decoder_joint = {
+                let builder = Session::builder()?;
+                let mut builder = exec_config.apply_to_session_builder(builder)?;
+                builder.commit_from_file(&decoder_joint_path)?
+            };
+            (encoder, decoder_joint)
+        };
 
         Ok(Self {
             encoder,
@@ -59,9 +106,19 @@ impl ParakeetTDTModel {
             config,
         })
     }
-    //file names simply from: https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/tree/main
+
+    fn ctx_filename(original: &Path) -> String {
+        let stem = original.file_stem().and_then(|s| s.to_str()).unwrap_or("model");
+        format!("{}_ctx.onnx", stem)
+    }
+    /// Set fixed mel frame count for static-shape NPU models.
+    pub fn set_fixed_frames(&mut self, frames: usize) {
+        self.config.fixed_frames = Some(frames);
+    }
+
     fn find_encoder(dir: &Path) -> Result<PathBuf> {
         let candidates = [
+            "encoder-model.fp32.static.npu.onnx",
             "encoder-model.onnx",
             "encoder.onnx",
             "encoder-model.int8.onnx",
@@ -91,6 +148,7 @@ impl ParakeetTDTModel {
 
     fn find_decoder_joint(dir: &Path) -> Result<PathBuf> {
         let candidates = [
+            "decoder_joint-model.fp32.static.onnx",
             "decoder_joint-model.onnx",
             "decoder_joint-model.int8.onnx",
             "decoder_joint.onnx",
@@ -124,17 +182,30 @@ impl ParakeetTDTModel {
 
     fn run_encoder(&mut self, features: &Array2<f32>) -> Result<(Array3<f32>, i64)> {
         let batch_size = 1;
-        let time_steps = features.shape()[0];
+        let actual_time_steps = features.shape()[0];
         let feature_size = features.shape()[1];
+        let padded_time_steps = self.config.fixed_frames.unwrap_or(actual_time_steps);
+        let actual_frames = actual_time_steps.min(padded_time_steps);
 
         // TDT encoder expects (batch, features, time) not (batch, time, features)
-        let input = features
-            .t()
-            .to_shape((batch_size, feature_size, time_steps))
-            .map_err(|e| Error::Model(format!("Failed to reshape encoder input: {e}")))?
-            .to_owned();
+        // When fixed_frames is set, zero-pad to the static size
+        let input = if padded_time_steps == actual_time_steps {
+            features
+                .t()
+                .to_shape((batch_size, feature_size, actual_time_steps))
+                .map_err(|e| Error::Model(format!("Failed to reshape encoder input: {e}")))?
+                .to_owned()
+        } else {
+            let mut padded = Array3::<f32>::zeros((batch_size, feature_size, padded_time_steps));
+            for f in 0..actual_frames {
+                for m in 0..feature_size {
+                    padded[[0, m, f]] = features[[f, m]];
+                }
+            }
+            padded
+        };
 
-        let input_length = Array1::from_vec(vec![time_steps as i64]);
+        let input_length = Array1::from_vec(vec![actual_frames as i64]);
 
         let input_value = ort::value::Value::from_array(input)?;
         let length_value = ort::value::Value::from_array(input_length)?;

@@ -33,6 +33,8 @@ pub enum ExecutionProvider {
     WebGPU,
     #[cfg(feature = "nnapi")]
     NNAPI,
+    #[cfg(feature = "vitisai")]
+    VitisAI,
 }
 
 #[derive(Clone)]
@@ -45,6 +47,18 @@ pub struct ModelConfig {
     /// recompiling the ONNX-to-CoreML conversion on each session load (~5s).
     /// Only used when execution_provider is CoreML.
     pub coreml_cache_dir: Option<PathBuf>,
+    /// VitisAI EP config file path (vai_ep_config.json).
+    /// Only used when execution_provider is VitisAI.
+    pub vitisai_config_file: Option<PathBuf>,
+    /// VitisAI EP cache directory for compiled NPU models (provider-level cache).
+    /// Only works with INT8 models when enable_cache_file_io_in_mem=0.
+    pub vitisai_cache_dir: Option<PathBuf>,
+    /// VitisAI EP cache key (subfolder name within cache_dir).
+    pub vitisai_cache_key: Option<String>,
+    /// Directory for ORT EP Context Cache files (_ctx.onnx).
+    /// When set, from_pretrained will check for pre-compiled context models
+    /// and generate them on first run. Works with all model types (FP32/INT8/BF16).
+    pub ep_context_cache_dir: Option<PathBuf>,
 }
 
 impl fmt::Debug for ModelConfig {
@@ -62,6 +76,10 @@ impl fmt::Debug for ModelConfig {
                 },
             )
             .field("coreml_cache_dir", &self.coreml_cache_dir)
+            .field("vitisai_config_file", &self.vitisai_config_file)
+            .field("vitisai_cache_dir", &self.vitisai_cache_dir)
+            .field("vitisai_cache_key", &self.vitisai_cache_key)
+            .field("ep_context_cache_dir", &self.ep_context_cache_dir)
             .finish()
     }
 }
@@ -74,6 +92,10 @@ impl Default for ModelConfig {
             inter_threads: 1,
             configure: None,
             coreml_cache_dir: None,
+            vitisai_config_file: None,
+            vitisai_cache_dir: None,
+            vitisai_cache_key: None,
+            ep_context_cache_dir: None,
         }
     }
 }
@@ -113,6 +135,32 @@ impl ModelConfig {
         self
     }
 
+    /// Set VitisAI EP config file path (vai_ep_config.json).
+    pub fn with_vitisai_config_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.vitisai_config_file = Some(path.into());
+        self
+    }
+
+    /// Set VitisAI EP cache directory for compiled NPU models.
+    pub fn with_vitisai_cache_dir(mut self, path: impl Into<PathBuf>) -> Self {
+        self.vitisai_cache_dir = Some(path.into());
+        self
+    }
+
+    /// Set VitisAI EP cache key (subfolder name within cache_dir).
+    pub fn with_vitisai_cache_key(mut self, key: impl Into<String>) -> Self {
+        self.vitisai_cache_key = Some(key.into());
+        self
+    }
+
+    /// Set directory for ORT EP Context Cache.
+    /// On first load, compiled context models (_ctx.onnx) are dumped here.
+    /// On subsequent loads, the context models are loaded directly, skipping compilation.
+    pub fn with_ep_context_cache_dir(mut self, path: impl Into<PathBuf>) -> Self {
+        self.ep_context_cache_dir = Some(path.into());
+        self
+    }
+
     pub(crate) fn apply_to_session_builder(
         &self,
         builder: SessionBuilder,
@@ -125,7 +173,8 @@ impl ModelConfig {
             feature = "migraphx",
             feature = "openvino",
             feature = "webgpu",
-            feature = "nnapi"
+            feature = "nnapi",
+            feature = "vitisai"
         ))]
         use ort::ep::CPU as CPUExecutionProvider;
         use ort::session::builder::GraphOptimizationLevel;
@@ -194,6 +243,24 @@ impl ModelConfig {
                 ort::ep::NNAPI::default().build(),
                 CPUExecutionProvider::default().build().error_on_failure(),
             ])?,
+
+            #[cfg(feature = "vitisai")]
+            ExecutionProvider::VitisAI => {
+                let mut vitis = ort::ep::Vitis::default();
+                if let Some(config_file) = &self.vitisai_config_file {
+                    vitis = vitis.with_config_file(config_file.to_string_lossy());
+                }
+                if let Some(cache_dir) = &self.vitisai_cache_dir {
+                    vitis = vitis.with_cache_dir(cache_dir.to_string_lossy());
+                }
+                if let Some(cache_key) = &self.vitisai_cache_key {
+                    vitis = vitis.with_cache_key(cache_key.as_str());
+                }
+                builder.with_execution_providers([
+                    vitis.build(),
+                    CPUExecutionProvider::default().build().error_on_failure(),
+                ])?
+            }
         };
 
         if let Some(configure) = self.configure.as_ref() {
