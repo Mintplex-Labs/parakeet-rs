@@ -46,53 +46,38 @@ impl ParakeetTDTModel {
 
         let config = TDTModelConfig::new(vocab_size);
 
+        // QNN EP: run encoder on NPU (with caching) but decoder on CPU.
+        // The decoder_joint model has dynamic output shapes that QNN EP
+        // rejects in ORT ≥1.22 and it's small enough that CPU is instant.
+        let decoder_on_cpu = matches!(exec_config.execution_provider, crate::execution::ExecutionProvider::QNN);
+
         let (encoder, decoder_joint) = if let Some(ref cache_dir) = exec_config.ep_context_cache_dir {
             std::fs::create_dir_all(cache_dir).ok();
             let enc_ctx = cache_dir.join(Self::ctx_filename(&encoder_path));
-            let dec_ctx = cache_dir.join(Self::ctx_filename(&decoder_joint_path));
 
-            if enc_ctx.exists() && dec_ctx.exists() {
-                // Fast path: load pre-compiled context models
-                let encoder = {
-                    let builder = Session::builder()?;
-                    let mut builder = exec_config.apply_to_session_builder(builder)?;
-                    builder.commit_from_file(&enc_ctx)?
-                };
-                let decoder_joint = {
-                    let builder = Session::builder()?;
-                    let mut builder = exec_config.apply_to_session_builder(builder)?;
-                    builder.commit_from_file(&dec_ctx)?
-                };
-                (encoder, decoder_joint)
+            let encoder = Self::load_or_compile_with_cache(
+                &exec_config, &encoder_path, &enc_ctx, "encoder",
+            )?;
+            let decoder_joint = if decoder_on_cpu {
+                eprintln!("[decoder_joint] Using CPU (dynamic shapes not supported on QNN EP)");
+                Self::load_decoder_cpu(&decoder_joint_path)?
             } else {
-                // Slow path: compile and dump context models for next time
-                let encoder = {
-                    let builder = Session::builder()?;
-                    let mut builder = exec_config.apply_to_session_builder(builder)?;
-                    builder = builder
-                        .with_config_entry("ep.context_enable", "1")?
-                        .with_config_entry("ep.context_file_path", enc_ctx.to_string_lossy().as_ref())?
-                        .with_config_entry("ep.context_embed_mode", "1")?;
-                    builder.commit_from_file(&encoder_path)?
-                };
-                let decoder_joint = {
-                    let builder = Session::builder()?;
-                    let mut builder = exec_config.apply_to_session_builder(builder)?;
-                    builder = builder
-                        .with_config_entry("ep.context_enable", "1")?
-                        .with_config_entry("ep.context_file_path", dec_ctx.to_string_lossy().as_ref())?
-                        .with_config_entry("ep.context_embed_mode", "1")?;
-                    builder.commit_from_file(&decoder_joint_path)?
-                };
-                (encoder, decoder_joint)
-            }
+                let dec_ctx = cache_dir.join(Self::ctx_filename(&decoder_joint_path));
+                Self::load_or_compile_with_cache(
+                    &exec_config, &decoder_joint_path, &dec_ctx, "decoder_joint",
+                )?
+            };
+            (encoder, decoder_joint)
         } else {
             let encoder = {
                 let builder = Session::builder()?;
                 let mut builder = exec_config.apply_to_session_builder(builder)?;
                 builder.commit_from_file(&encoder_path)?
             };
-            let decoder_joint = {
+            let decoder_joint = if decoder_on_cpu {
+                eprintln!("[decoder_joint] Using CPU (dynamic shapes not supported on QNN EP)");
+                Self::load_decoder_cpu(&decoder_joint_path)?
+            } else {
                 let builder = Session::builder()?;
                 let mut builder = exec_config.apply_to_session_builder(builder)?;
                 builder.commit_from_file(&decoder_joint_path)?
@@ -111,7 +96,80 @@ impl ParakeetTDTModel {
         let stem = original.file_stem().and_then(|s| s.to_str()).unwrap_or("model");
         format!("{}_ctx.onnx", stem)
     }
-    /// Set fixed mel frame count for static-shape NPU models.
+    /// Load a single model from EP context cache if available, otherwise
+    /// compile from the original ONNX and try to save a cache for next time.
+    /// Each model is cached independently so one failure doesn't block the other.
+    fn load_or_compile_with_cache(
+        exec_config: &ExecutionConfig,
+        model_path: &Path,
+        ctx_path: &Path,
+        label: &str,
+    ) -> Result<Session> {
+        // Fast path: cached context file exists
+        if ctx_path.exists() {
+            eprintln!("[{}] Loading from EP context cache: {}", label, ctx_path.display());
+            let builder = Session::builder()?;
+            let mut builder = exec_config.apply_to_session_builder(builder)?;
+            return Ok(builder.commit_from_file(ctx_path)?);
+        }
+
+        // Slow path: compile from original ONNX, try to save context cache
+        eprintln!("[{}] No cache found, compiling from ONNX (will attempt to cache)...", label);
+        let cached_result: std::result::Result<Session, Error> = (|| {
+            let builder = Session::builder()?;
+            let mut builder = exec_config.apply_to_session_builder(builder)?;
+            builder = builder
+                .with_config_entry("ep.context_enable", "1")?
+                .with_config_entry("ep.context_file_path", ctx_path.to_string_lossy().as_ref())?
+                .with_config_entry("ep.context_embed_mode", "0")?;
+            Ok(builder.commit_from_file(model_path)?)
+        })();
+
+        match cached_result {
+            Ok(session) => {
+                eprintln!("[{}] Compiled and cached to: {}", label, ctx_path.display());
+                Ok(session)
+            }
+            Err(e) => {
+                eprintln!("[{}] Context cache save failed ({}), compiling without cache", label, e);
+                Self::cleanup_ctx_files(ctx_path);
+                let builder = Session::builder()?;
+                let mut builder = exec_config.apply_to_session_builder(builder)?;
+                Ok(builder.commit_from_file(model_path)?)
+            }
+        }
+    }
+
+    /// Remove a context file and its QNN companion .bin files.
+    fn cleanup_ctx_files(ctx_path: &Path) {
+        let _ = std::fs::remove_file(ctx_path);
+        // QNN creates companion files like <ctx_path>_QNNExecutionProvider_*.bin
+        if let Some(parent) = ctx_path.parent() {
+            if let Some(ctx_name) = ctx_path.file_name().and_then(|n| n.to_str()) {
+                if let Ok(entries) = std::fs::read_dir(parent) {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name();
+                        if let Some(name_str) = name.to_str() {
+                            if name_str.starts_with(ctx_name) && name_str.ends_with(".bin") {
+                                let _ = std::fs::remove_file(entry.path());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Load the decoder on CPU only — no EP, no graph optimization.
+    /// The decoder is tiny and runs instantly on CPU.
+    fn load_decoder_cpu(path: &Path) -> Result<Session> {
+        use ort::session::builder::GraphOptimizationLevel;
+        let mut builder = Session::builder()?
+            .with_optimization_level(GraphOptimizationLevel::Disable)?
+            .with_intra_threads(4)?;
+        Ok(builder.commit_from_file(path)?)
+    }
+
     pub fn set_fixed_frames(&mut self, frames: usize) {
         self.config.fixed_frames = Some(frames);
     }

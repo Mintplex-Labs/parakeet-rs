@@ -1,5 +1,6 @@
 use std::path::PathBuf;
-use std::{fmt, rc::Rc};
+use std::sync::Arc;
+use std::fmt;
 
 use crate::error::Result;
 use ort::session::builder::SessionBuilder;
@@ -44,7 +45,7 @@ pub struct ModelConfig {
     pub execution_provider: ExecutionProvider,
     pub intra_threads: usize,
     pub inter_threads: usize,
-    pub configure: Option<Rc<dyn Fn(SessionBuilder) -> ort::Result<SessionBuilder>>>,
+    pub configure: Option<Arc<dyn Fn(SessionBuilder) -> ort::Result<SessionBuilder> + Send + Sync>>,
     /// Optional cache directory for compiled CoreML models. When set, avoids
     /// recompiling the ONNX-to-CoreML conversion on each session load (~5s).
     /// Only used when execution_provider is CoreML.
@@ -124,9 +125,9 @@ impl ModelConfig {
 
     pub fn with_custom_configure(
         mut self,
-        configure: impl Fn(SessionBuilder) -> ort::Result<SessionBuilder> + 'static,
+        configure: impl Fn(SessionBuilder) -> ort::Result<SessionBuilder> + Send + Sync + 'static,
     ) -> Self {
-        self.configure = Some(Rc::new(configure));
+        self.configure = Some(Arc::new(configure));
         self
     }
 
@@ -182,8 +183,14 @@ impl ModelConfig {
         use ort::ep::CPU as CPUExecutionProvider;
         use ort::session::builder::GraphOptimizationLevel;
 
+        let opt_level = match self.execution_provider {
+            #[cfg(feature = "qnn")]
+            ExecutionProvider::QNN => GraphOptimizationLevel::Disable,
+            _ => GraphOptimizationLevel::Level3,
+        };
+
         let mut builder = builder
-            .with_optimization_level(GraphOptimizationLevel::Level3)?
+            .with_optimization_level(opt_level)?
             .with_intra_threads(self.intra_threads)?
             .with_inter_threads(self.inter_threads)?;
 
@@ -270,9 +277,13 @@ impl ModelConfig {
                 use ort::ep::ArbitrarilyConfigurableExecutionProvider;
                 let qnn = ort::ep::QNN::default()
                     .with_backend_path("QnnHtp.dll")
+                    .with_arbitrary_config("soc_model", "60")
+                    .with_arbitrary_config("htp_arch", "73")
+                    .with_arbitrary_config("vtcm_mb", "8")
                     .with_arbitrary_config("htp_performance_mode", "burst")
                     .with_arbitrary_config("enable_htp_fp16_precision", "1")
-                    .with_arbitrary_config("htp_graph_finalization_optimization_mode", "3");
+                    .with_arbitrary_config("htp_graph_finalization_optimization_mode", "0")
+                    .with_arbitrary_config("enable_htp_spill_fill_buffer", "1");
                 builder.with_execution_providers([
                     qnn.build(),
                     CPUExecutionProvider::default().build().error_on_failure(),
