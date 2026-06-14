@@ -122,6 +122,7 @@ impl ParakeetTDTModel {
             "encoder-model.onnx",
             "encoder.onnx",
             "encoder-model.int8.onnx",
+            "encoder/model.onnx",
         ];
         for candidate in &candidates {
             let path = dir.join(candidate);
@@ -215,8 +216,12 @@ impl ParakeetTDTModel {
             "length" => length_value
         ))?;
 
-        let encoder_out = &outputs["outputs"];
-        let encoder_lens = &outputs["encoded_lengths"];
+        let encoder_out = outputs.get("outputs")
+            .or_else(|| outputs.get("output_0"))
+            .ok_or_else(|| Error::Model("No encoder output tensor found (tried 'outputs', 'output_0')".into()))?;
+        let encoder_lens = outputs.get("encoded_lengths")
+            .or_else(|| outputs.get("output_1"))
+            .ok_or_else(|| Error::Model("No encoder lengths tensor found (tried 'encoded_lengths', 'output_1')".into()))?;
 
         let (shape, data) = encoder_out
             .try_extract_tensor::<f32>()

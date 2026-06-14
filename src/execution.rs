@@ -35,6 +35,8 @@ pub enum ExecutionProvider {
     NNAPI,
     #[cfg(feature = "vitisai")]
     VitisAI,
+    #[cfg(feature = "qnn")]
+    QNN,
 }
 
 #[derive(Clone)]
@@ -174,7 +176,8 @@ impl ModelConfig {
             feature = "openvino",
             feature = "webgpu",
             feature = "nnapi",
-            feature = "vitisai"
+            feature = "vitisai",
+            feature = "qnn"
         ))]
         use ort::ep::CPU as CPUExecutionProvider;
         use ort::session::builder::GraphOptimizationLevel;
@@ -258,6 +261,20 @@ impl ModelConfig {
                 }
                 builder.with_execution_providers([
                     vitis.build(),
+                    CPUExecutionProvider::default().build().error_on_failure(),
+                ])?
+            }
+
+            #[cfg(feature = "qnn")]
+            ExecutionProvider::QNN => {
+                use ort::ep::ArbitrarilyConfigurableExecutionProvider;
+                let qnn = ort::ep::QNN::default()
+                    .with_backend_path("QnnHtp.dll")
+                    .with_arbitrary_config("htp_performance_mode", "burst")
+                    .with_arbitrary_config("enable_htp_fp16_precision", "1")
+                    .with_arbitrary_config("htp_graph_finalization_optimization_mode", "3");
+                builder.with_execution_providers([
+                    qnn.build(),
                     CPUExecutionProvider::default().build().error_on_failure(),
                 ])?
             }
