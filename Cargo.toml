@@ -57,8 +57,12 @@ realfft = "3"
 [features]
 default = ["cpu", "ort-defaults", "api-28"]
 cpu = []
-ort-defaults = ["ort/default"]
+# ort's own `default` feature pins the API level to api-27 (ORT >= 1.27). tinyscribe needs to
+# run against older runtimes (Intel macOS only has ONNX Runtime 1.23 dylibs), so the API level is
+# selected separately through the `api-XX` features below instead of coming from ort/default.
+ort-defaults = ["ort/std", "ort/ndarray", "ort/tracing", "ort/download-binaries", "ort/tls-native", "ort/copy-dylibs"]
 
+api-23 = ["ort/api-23"]
 api-24 = ["ort/api-24"]
 api-25 = ["ort/api-25"]
 api-26 = ["ort/api-26"]
