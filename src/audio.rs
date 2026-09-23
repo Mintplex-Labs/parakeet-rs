@@ -2,8 +2,30 @@ use crate::config::PreprocessorConfig;
 use crate::error::{Error, Result};
 use hound::{WavReader, WavSpec};
 use ndarray::Array2;
+use realfft::RealToComplex;
 use std::f32::consts::PI;
 use std::path::Path;
+use std::sync::Arc;
+
+/// Cached, reusable mel filterbank + FFT plan keyed to a preprocessor
+/// cfgs.
+pub struct FeatureCache {
+    pub mel_basis: Array2<f32>,
+    pub fft_plan: Arc<dyn RealToComplex<f32>>,
+}
+
+impl FeatureCache {
+    pub fn from_config(config: &PreprocessorConfig) -> Self {
+        let mel_basis =
+            create_mel_filterbank(config.n_fft, config.feature_size, config.sampling_rate);
+        let mut planner = realfft::RealFftPlanner::<f32>::new();
+        let fft_plan = planner.plan_fft_forward(config.n_fft);
+        Self {
+            mel_basis,
+            fft_plan,
+        }
+    }
+}
 
 pub fn load_audio<P: AsRef<Path>>(path: P) -> Result<(Vec<f32>, WavSpec)> {
     let mut reader = WavReader::open(path)?;
@@ -25,6 +47,10 @@ pub fn load_audio<P: AsRef<Path>>(path: P) -> Result<(Vec<f32>, WavSpec)> {
 }
 
 pub fn apply_preemphasis(audio: &[f32], coef: f32) -> Vec<f32> {
+    if audio.is_empty() {
+        return Vec::new();
+    }
+
     let mut result = Vec::with_capacity(audio.len());
     result.push(audio[0]);
 
@@ -51,33 +77,48 @@ pub fn stft(
     hop_length: usize,
     win_length: usize,
 ) -> Result<Array2<f32>> {
-    use realfft::RealFftPlanner;
+    let mut planner = realfft::RealFftPlanner::<f32>::new();
+    let plan = planner.plan_fft_forward(n_fft);
+    stft_with_plan(audio, &plan, n_fft, hop_length, win_length)
+}
 
+/// Same as [`stft`] but takes a pre built FFT plan to avoid rebuilding it
+/// per call. The plan is deterministic from `n_fft`.
+pub fn stft_with_plan(
+    audio: &[f32],
+    plan: &Arc<dyn RealToComplex<f32>>,
+    n_fft: usize,
+    hop_length: usize,
+    win_length: usize,
+) -> Result<Array2<f32>> {
     let pad_amount = n_fft / 2;
     let mut padded = vec![0.0f32; pad_amount];
     padded.extend_from_slice(audio);
     padded.resize(padded.len() + pad_amount, 0.0);
 
     let window = hann_window(win_length);
-    let num_frames = (padded.len() - n_fft) / hop_length + 1;
+    // NeMo reports floor(audio_len / hop_length) valid frames. torch.stft
+    // produces one additional trailing frame, which NeMo masks out before
+    // normalization and encoding.
+    let num_frames = audio.len() / hop_length;
     let freq_bins = n_fft / 2 + 1;
     let mut spectrogram = Array2::<f32>::zeros((freq_bins, num_frames));
+    // torch.stft centers a window shorter than n_fft in the FFT buffer.
+    let window_offset = (n_fft - win_length) / 2;
 
-    let mut planner = RealFftPlanner::<f32>::new();
-    let r2c = planner.plan_fft_forward(n_fft);
     let mut input = vec![0.0f32; n_fft];
-    let mut output = r2c.make_output_vec();
-    let mut scratch = r2c.make_scratch_vec();
+    let mut output = plan.make_output_vec();
+    let mut scratch = plan.make_scratch_vec();
 
     for frame_idx in 0..num_frames {
         let start = frame_idx * hop_length;
 
         input.fill(0.0);
-        for i in 0..win_length.min(padded.len() - start) {
-            input[i] = padded[start + i] * window[i];
+        for i in 0..win_length {
+            input[window_offset + i] = padded[start + window_offset + i] * window[i];
         }
 
-        r2c.process_with_scratch(&mut input, &mut output, &mut scratch)
+        plan.process_with_scratch(&mut input, &mut output, &mut scratch)
             .map_err(|e| Error::Audio(format!("FFT failed: {e}")))?;
 
         for k in 0..freq_bins {
@@ -152,21 +193,27 @@ pub fn create_mel_filterbank(n_fft: usize, n_mels: usize, sample_rate: usize) ->
 
 /// Extract mel spectrogram features from raw audio samples.
 ///
+/// The `cache` holds the mel filterbank and FFT plan built once at model
+/// load — these are deterministic from `config` and identical across calls,
+/// so reusing them avoids rebuilding ~15-20 µs of arithmetic per request.
+///
 /// # Arguments
 ///
 /// * `audio` - Audio samples as f32 values
 /// * `sample_rate` - Sample rate in Hz
 /// * `channels` - Number of audio channels
 /// * `config` - Preprocessor configuration
+/// * `cache` - Pre-built mel filterbank + FFT plan (see [`FeatureCache::from_config`])
 ///
 /// # Returns
 ///
 /// 2D array of mel spectrogram features (time_steps x feature_size)
-pub fn extract_features_raw(
+pub fn extract_features_with_cache(
     mut audio: Vec<f32>,
     sample_rate: u32,
     channels: u16,
     config: &PreprocessorConfig,
+    cache: &FeatureCache,
 ) -> Result<Array2<f32>> {
     if sample_rate != config.sampling_rate as u32 {
         return Err(Error::Audio(format!(
@@ -185,11 +232,15 @@ pub fn extract_features_raw(
 
     audio = apply_preemphasis(&audio, config.preemphasis);
 
-    let spectrogram = stft(&audio, config.n_fft, config.hop_length, config.win_length)?;
+    let spectrogram = stft_with_plan(
+        &audio,
+        &cache.fft_plan,
+        config.n_fft,
+        config.hop_length,
+        config.win_length,
+    )?;
 
-    let mel_filterbank =
-        create_mel_filterbank(config.n_fft, config.feature_size, config.sampling_rate);
-    let mel_spectrogram = mel_filterbank.dot(&spectrogram);
+    let mel_spectrogram = cache.mel_basis.dot(&spectrogram);
     // Log with additive guard (NeMo: log_zero_guard_type="add", value=2^-24)
     let log_zero_guard: f32 = 2.0f32.powi(-24);
     let mel_spectrogram = mel_spectrogram.mapv(|x| (x + log_zero_guard).ln());
@@ -199,6 +250,10 @@ pub fn extract_features_raw(
     // Normalize per_feature: mean=0, std=1 with Bessel's correction (N-1)
     let num_frames = mel_spectrogram.shape()[0];
     let num_features = mel_spectrogram.shape()[1];
+
+    if num_frames <= 1 {
+        return Ok(mel_spectrogram);
+    }
 
     for feat_idx in 0..num_features {
         let mut column = mel_spectrogram.column_mut(feat_idx);
@@ -276,7 +331,6 @@ mod tests {
 
         let freq_bins = n_fft / 2 + 1;
         assert_eq!(spec.shape()[0], freq_bins);
-        // num_frames = (audio_len + n_fft - n_fft) / hop_length + 1 = 16000 / 160 + 1 = 101
-        assert!(spec.shape()[1] > 0);
+        assert_eq!(spec.shape()[1], audio.len() / hop_length);
     }
 }

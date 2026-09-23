@@ -24,15 +24,18 @@ pub struct ParakeetTDTModel {
 }
 
 impl ParakeetTDTModel {
-    /// Load TDT model from directory containing encoder and decoder_joint ONNX files
+    /// Load a TDT model, running the encoder and the decoder/joint under separate execution
+    /// configurations.
     ///
     /// # Arguments
     /// * `model_dir` - Directory containing encoder and decoder_joint ONNX files
-    /// * `exec_config` - Execution configuration for ONNX runtime
+    /// * `exec_config` - Execution configuration for the encoder session
+    /// * `joint_config` - Execution configuration for the decoder/joint session
     /// * `vocab_size` - Vocabulary size (number of tokens including blank)
-    pub fn from_pretrained<P: AsRef<Path>>(
+    pub fn from_pretrained_with_configs<P: AsRef<Path>>(
         model_dir: P,
         exec_config: ExecutionConfig,
+        joint_config: ExecutionConfig,
         vocab_size: usize,
     ) -> Result<Self> {
         let model_dir = model_dir.as_ref();
@@ -43,15 +46,8 @@ impl ParakeetTDTModel {
 
         let config = TDTModelConfig::new(vocab_size);
 
-        // Load encoder
-        let builder = Session::builder()?;
-        let builder = exec_config.apply_to_session_builder(builder)?;
-        let encoder = builder.commit_from_file(&encoder_path)?;
-
-        // Load decoder_joint
-        let builder = Session::builder()?;
-        let builder = exec_config.apply_to_session_builder(builder)?;
-        let decoder_joint = builder.commit_from_file(&decoder_joint_path)?;
+        let encoder = exec_config.build_session(&encoder_path)?;
+        let decoder_joint = joint_config.build_session(&decoder_joint_path)?;
 
         Ok(Self {
             encoder,
@@ -77,10 +73,11 @@ impl ParakeetTDTModel {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                    if name.starts_with("encoder") && name.ends_with(".onnx") {
-                        return Ok(path);
-                    }
+                if let Some(name) = path.file_name().and_then(|s| s.to_str())
+                    && name.starts_with("encoder")
+                    && name.ends_with(".onnx")
+                {
+                    return Ok(path);
                 }
             }
         }
@@ -157,33 +154,13 @@ impl ParakeetTDTModel {
             "length" => length_value
         ))?;
 
-        let encoder_out = &outputs["outputs"];
-        let encoder_lens = &outputs["encoded_lengths"];
-
-        let (shape, data) = encoder_out
-            .try_extract_tensor::<f32>()
-            .map_err(|e| Error::Model(format!("Failed to extract encoder output: {e}")))?;
-
-        let (_, lens_data) = encoder_lens
-            .try_extract_tensor::<i64>()
-            .map_err(|e| Error::Model(format!("Failed to extract encoder lengths: {e}")))?;
-
-        let shape_dims = shape.as_ref();
-        if shape_dims.len() != 3 {
-            return Err(Error::Model(format!(
-                "Expected 3D encoder output, got shape: {shape_dims:?}"
-            )));
-        }
-
-        let b = shape_dims[0] as usize;
-        let t = shape_dims[1] as usize;
-        let d = shape_dims[2] as usize;
-
-        let encoder_array = Array3::from_shape_vec((b, t, d), data.to_vec())
-            .map_err(|e| Error::Model(format!("Failed to create encoder array: {e}")))?;
-
         // TDT encoder outputs [batch, encoder_dim, time] directly
-        Ok((encoder_array, lens_data[0]))
+        let encoder_array =
+            crate::tensor_utils::extract_3d_f32(&outputs["outputs"], "encoder output")?;
+        let encoded_len =
+            crate::tensor_utils::extract_scalar_i64(&outputs["encoded_lengths"], "encoder lengths")?;
+
+        Ok((encoder_array, encoded_len))
     }
 
     fn greedy_decode(
