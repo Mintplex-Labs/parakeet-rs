@@ -48,31 +48,67 @@ pub fn process_timestamps(tokens: &[TimedToken], mode: TimestampMode) -> Vec<Tim
     }
 }
 
-// Group tokens into words based on word boundary markers
-fn group_by_words(tokens: &[TimedToken]) -> Vec<TimedToken> {
-    if tokens.is_empty() {
-        return Vec::new();
+/// Rebuild a flat transcript string from mode-grouped tokens.
+///
+/// Shared by every timestamped transcribe path so spacing/punctuation rules
+/// live in one place:
+/// - `Tokens`: concatenate raw SentencePiece pieces and trim.
+/// - `Words`: join words with single spaces, attaching standalone punctuation
+///   (".", ",", etc.) to the preceding word with no leading space.
+/// - `Sentences`: join sentence strings with single spaces.
+///
+/// Expects `tokens` to already be at the requested granularity (i.e. the output
+/// of [`process_timestamps`] for the same `mode`).
+pub fn rebuild_text(tokens: &[TimedToken], mode: TimestampMode) -> String {
+    match mode {
+        TimestampMode::Tokens => tokens
+            .iter()
+            .map(|t| t.text.as_str())
+            .collect::<String>()
+            .trim()
+            .to_string(),
+        TimestampMode::Words => {
+            let mut out = String::new();
+            for (i, word) in tokens.iter().map(|t| t.text.as_str()).enumerate() {
+                let is_standalone_punct = word.len() == 1
+                    && word
+                        .chars()
+                        .all(|c| matches!(c, '.' | ',' | '!' | '?' | ';' | ':' | ')'));
+                if i > 0 && !is_standalone_punct {
+                    out.push(' ');
+                }
+                out.push_str(word);
+            }
+            out
+        }
+        TimestampMode::Sentences => tokens
+            .iter()
+            .map(|t| t.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" "),
     }
+}
+
+// Group tokens into words based on word boundary markers
+pub(crate) fn group_by_words(tokens: &[TimedToken]) -> Vec<TimedToken> {
+    let Some(last_token) = tokens.last() else {
+        return Vec::new();
+    };
 
     let mut words = Vec::new();
     let mut current_word_text = String::new();
     let mut current_word_start = 0.0;
-    let mut last_word_lower = String::new();
 
     for (i, token) in tokens.iter().enumerate() {
         // Space-only tokens (from SentencePiece ▁ word boundaries) act as word separators
         // but don't contribute text. Save current word if we hit one.
         if token.text.trim().is_empty() {
             if !current_word_text.is_empty() {
-                let word_lower = current_word_text.to_lowercase();
-                if word_lower != last_word_lower {
-                    words.push(TimedToken {
-                        text: current_word_text.clone(),
-                        start: current_word_start,
-                        end: if i > 0 { tokens[i - 1].end } else { token.end },
-                    });
-                    last_word_lower = word_lower;
-                }
+                words.push(TimedToken {
+                    text: current_word_text.clone(),
+                    start: current_word_start,
+                    end: if i > 0 { tokens[i - 1].end } else { token.end },
+                });
                 current_word_text.clear();
             }
             continue;
@@ -97,16 +133,12 @@ fn group_by_words(tokens: &[TimedToken]) -> Vec<TimedToken> {
                 || i == 0;
 
         if starts_word && !current_word_text.is_empty() {
-            // Save previous word (with deduplication)
-            let word_lower = current_word_text.to_lowercase();
-            if word_lower != last_word_lower {
-                words.push(TimedToken {
-                    text: current_word_text.clone(),
-                    start: current_word_start,
-                    end: tokens[i - 1].end,
-                });
-                last_word_lower = word_lower;
-            }
+            // Save previous word
+            words.push(TimedToken {
+                text: current_word_text.clone(),
+                start: current_word_start,
+                end: tokens[i - 1].end,
+            });
             current_word_text.clear();
         }
 
@@ -122,14 +154,11 @@ fn group_by_words(tokens: &[TimedToken]) -> Vec<TimedToken> {
 
     // Add final word
     if !current_word_text.is_empty() {
-        let word_lower = current_word_text.to_lowercase();
-        if word_lower != last_word_lower {
-            words.push(TimedToken {
-                text: current_word_text,
-                start: current_word_start,
-                end: tokens.last().unwrap().end,
-            });
-        }
+        words.push(TimedToken {
+            text: current_word_text,
+            start: current_word_start,
+            end: last_token.end,
+        });
     }
 
     words
@@ -147,44 +176,38 @@ fn group_by_sentences(tokens: &[TimedToken]) -> Vec<TimedToken> {
     let mut current_sentence = Vec::new();
 
     for word in words {
-        current_sentence.push(word.clone());
-
         // Check if word ends with sentence terminator
         let ends_sentence =
             word.text.contains('.') || word.text.contains('?') || word.text.contains('!');
 
-        if ends_sentence {
-            let sentence_text = format_sentence(&current_sentence);
-            let start = current_sentence.first().unwrap().start;
-            let end = current_sentence.last().unwrap().end;
+        current_sentence.push(word);
 
-            if !sentence_text.is_empty() {
-                sentences.push(TimedToken {
-                    text: sentence_text,
-                    start,
-                    end,
-                });
-            }
+        if ends_sentence {
+            push_sentence(&mut sentences, &current_sentence);
             current_sentence.clear();
         }
     }
 
     // Add final sentence if exists
-    if !current_sentence.is_empty() {
-        let sentence_text = format_sentence(&current_sentence);
-        let start = current_sentence.first().unwrap().start;
-        let end = current_sentence.last().unwrap().end;
-
-        if !sentence_text.is_empty() {
-            sentences.push(TimedToken {
-                text: sentence_text,
-                start,
-                end,
-            });
-        }
-    }
+    push_sentence(&mut sentences, &current_sentence);
 
     sentences
+}
+
+// Append `words` to `sentences` as a single formatted sentence
+fn push_sentence(sentences: &mut Vec<TimedToken>, words: &[TimedToken]) {
+    let (Some(first), Some(last)) = (words.first(), words.last()) else {
+        return;
+    };
+
+    let text = format_sentence(words);
+    if !text.is_empty() {
+        sentences.push(TimedToken {
+            text,
+            start: first.start,
+            end: last.end,
+        });
+    }
 }
 
 // Join words with punctuation spacing
@@ -313,6 +336,22 @@ mod tests {
 
         let result = format_sentence(&words);
         assert_eq!(result, "uh uh hello");
+    }
+
+    #[test]
+    fn test_word_grouping_keeps_repeated_words() {
+        let tokens: Vec<TimedToken> = ["▁the", "▁the", "▁thing"]
+            .iter()
+            .enumerate()
+            .map(|(i, t)| TimedToken {
+                text: t.to_string(),
+                start: i as f32,
+                end: i as f32 + 1.0,
+            })
+            .collect();
+        let words = group_by_words(&tokens);
+        let texts: Vec<&str> = words.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(texts, ["the", "the", "thing"]);
     }
 
     #[test]
