@@ -8,12 +8,18 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone)]
 pub struct TDTModelConfig {
     pub vocab_size: usize,
+    /// Static-shape encoders (e.g. NPU exports) take exactly this many mel frames. Shorter input
+    /// is zero-padded after normalization and the real length is passed in `length`.
+    pub fixed_frames: Option<usize>,
 }
 
 impl TDTModelConfig {
     /// Create config with specified vocab size
     pub fn new(vocab_size: usize) -> Self {
-        Self { vocab_size }
+        Self {
+            vocab_size,
+            fixed_frames: None,
+        }
     }
 }
 
@@ -44,7 +50,8 @@ impl ParakeetTDTModel {
         let encoder_path = Self::find_encoder(model_dir)?;
         let decoder_joint_path = Self::find_decoder_joint(model_dir)?;
 
-        let config = TDTModelConfig::new(vocab_size);
+        let mut config = TDTModelConfig::new(vocab_size);
+        config.fixed_frames = Self::read_fixed_frames(model_dir)?;
 
         let encoder = exec_config.build_session(&encoder_path)?;
         let decoder_joint = joint_config.build_session(&decoder_joint_path)?;
@@ -55,9 +62,31 @@ impl ParakeetTDTModel {
             config,
         })
     }
+    /// Mel frame count from `static_config.json` (`{"fixed_frames": N}`), present only next to
+    /// static-shape encoder exports.
+    fn read_fixed_frames(dir: &Path) -> Result<Option<usize>> {
+        let path = dir.join("static_config.json");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let text = std::fs::read_to_string(&path)?;
+        let json: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| Error::Config(format!("Invalid {}: {e}", path.display())))?;
+        json["fixed_frames"]
+            .as_u64()
+            .map(|n| Some(n as usize))
+            .ok_or_else(|| Error::Config(format!("fixed_frames missing in {}", path.display())))
+    }
+
+    /// Mel frames a static-shape encoder accepts per call, if this is one.
+    pub fn fixed_frames(&self) -> Option<usize> {
+        self.config.fixed_frames
+    }
+
     //file names simply from: https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/tree/main
     fn find_encoder(dir: &Path) -> Result<PathBuf> {
         let candidates = [
+            "encoder-model.fp32.static.npu.onnx",
             "encoder-model.onnx",
             "encoder.onnx",
             "encoder-model.fp16.onnx",
@@ -89,6 +118,7 @@ impl ParakeetTDTModel {
 
     fn find_decoder_joint(dir: &Path) -> Result<PathBuf> {
         let candidates = [
+            "decoder_joint-model.fp32.static.onnx",
             "decoder_joint-model.onnx",
             "decoder_joint-model.fp16.onnx",
             "decoder_joint-model.int8.onnx",
@@ -125,6 +155,14 @@ impl ParakeetTDTModel {
     ) -> Result<(Vec<usize>, Vec<usize>, Vec<usize>)> {
         // Run encoder
         let (encoder_out, encoder_len) = self.run_encoder(&features)?;
+        if std::env::var_os("PARAKEET_DEBUG_ENCODER").is_some() {
+            eprintln!(
+                "encoder: {} mel frames -> encoded_len {} of {} output frames",
+                features.shape()[0],
+                encoder_len,
+                encoder_out.shape()[2]
+            );
+        }
 
         // Run greedy decoding with decoder_joint
         let (tokens, frame_indices, durations) = self.greedy_decode(&encoder_out, encoder_len)?;
@@ -137,12 +175,23 @@ impl ParakeetTDTModel {
         let time_steps = features.shape()[0];
         let feature_size = features.shape()[1];
 
+        // Static-shape encoders take a fixed frame count: pad the tail with zeros (the normalized
+        // mean) and report the real length so encoded_lengths covers only real audio.
+        let padded_steps = match self.config.fixed_frames {
+            Some(fixed) if time_steps > fixed => {
+                return Err(Error::Model(format!(
+                    "Input has {time_steps} mel frames but the static encoder takes at most {fixed}"
+                )));
+            }
+            Some(fixed) => fixed,
+            None => time_steps,
+        };
+
         // TDT encoder expects (batch, features, time) not (batch, time, features)
-        let input = features
-            .t()
-            .to_shape((batch_size, feature_size, time_steps))
-            .map_err(|e| Error::Model(format!("Failed to reshape encoder input: {e}")))?
-            .to_owned();
+        let mut input = Array3::<f32>::zeros((batch_size, feature_size, padded_steps));
+        input
+            .slice_mut(ndarray::s![0, .., ..time_steps])
+            .assign(&features.t());
 
         let input_length = Array1::from_vec(vec![time_steps as i64]);
 
@@ -166,11 +215,12 @@ impl ParakeetTDTModel {
     fn greedy_decode(
         &mut self,
         encoder_out: &Array3<f32>,
-        _encoder_len: i64,
+        encoder_len: i64,
     ) -> Result<(Vec<usize>, Vec<usize>, Vec<usize>)> {
-        // encoder_out shape: [batch, encoder_dim, time]
+        // encoder_out shape: [batch, encoder_dim, time]. Frames past encoder_len are padding
+        // (static-shape encoders) and must not be decoded.
         let encoder_dim = encoder_out.shape()[1];
-        let time_steps = encoder_out.shape()[2];
+        let time_steps = encoder_out.shape()[2].min(encoder_len.max(0) as usize);
         let vocab_size = self.config.vocab_size;
         let max_tokens_per_step = 10;
         let blank_id = vocab_size - 1;

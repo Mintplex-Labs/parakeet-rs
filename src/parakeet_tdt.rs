@@ -114,6 +114,14 @@ impl ParakeetTDT {
     pub fn preprocessor_config(&self) -> &PreprocessorConfig {
         &self.preprocessor_config
     }
+
+    /// Most 16 kHz mono samples one `transcribe_samples` call accepts, for static-shape encoders
+    /// (`static_config.json` next to the model). `None` means any length.
+    pub fn max_samples_per_call(&self) -> Option<usize> {
+        self.model
+            .fixed_frames()
+            .map(|frames| frames * self.preprocessor_config.hop_length)
+    }
 }
 
 impl Transcriber for ParakeetTDT {

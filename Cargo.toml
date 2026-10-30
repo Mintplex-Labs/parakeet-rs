@@ -76,6 +76,8 @@ migraphx = ["ort/migraphx"]
 openvino = ["ort/openvino"]
 webgpu = ["ort/webgpu"]
 nnapi = ["ort/nnapi"]
+# AMD Ryzen AI NPU. Needs a runtime with the VitisAI EP (AMD's onnxruntime.dll), so use with load-dynamic.
+vitisai = ["ort/vitis"]
 sortformer = []
 multitalker = ["sortformer"]
 cohere = []

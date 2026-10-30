@@ -34,6 +34,10 @@ pub enum ExecutionProvider {
     WebGPU,
     #[cfg(feature = "nnapi")]
     NNAPI,
+    /// AMD Ryzen AI NPU. Only static-shape exports compiled for the NPU run there; options such as
+    /// `config_file` / `cache_dir` / `cache_key` go through [`ModelConfig::with_vitisai_option`].
+    #[cfg(feature = "vitisai")]
+    VitisAI,
 }
 
 /// Which compute units the CoreML execution provider may use.
@@ -57,6 +61,8 @@ pub struct ModelConfig {
     /// Only used when execution_provider is CoreML.
     pub coreml_cache_dir: Option<PathBuf>,
     pub coreml_compute_units: CoreMLComputeUnits,
+    /// VitisAI provider options (key, value). Only used when execution_provider is VitisAI.
+    pub vitisai_options: Vec<(String, String)>,
 }
 
 impl fmt::Debug for ModelConfig {
@@ -75,6 +81,7 @@ impl fmt::Debug for ModelConfig {
             )
             .field("coreml_cache_dir", &self.coreml_cache_dir)
             .field("coreml_compute_units", &self.coreml_compute_units)
+            .field("vitisai_options", &self.vitisai_options)
             .finish()
     }
 }
@@ -88,6 +95,7 @@ impl Default for ModelConfig {
             configure: None,
             coreml_cache_dir: None,
             coreml_compute_units: CoreMLComputeUnits::default(),
+            vitisai_options: Vec::new(),
         }
     }
 }
@@ -133,6 +141,12 @@ impl ModelConfig {
         self.coreml_compute_units = units;
         self
     }
+    /// Set a VitisAI provider option, e.g. `config_file`, `cache_dir`, `cache_key`.
+    pub fn with_vitisai_option(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.vitisai_options.push((key.into(), value.into()));
+        self
+    }
+
     /// Build a session for `path` under this configuration.
     pub fn build_session(&self, path: &Path) -> Result<Session> {
         let builder = Session::builder()?;
@@ -152,7 +166,8 @@ impl ModelConfig {
             feature = "migraphx",
             feature = "openvino",
             feature = "webgpu",
-            feature = "nnapi"
+            feature = "nnapi",
+            feature = "vitisai"
         ))]
         use ort::ep::CPU as CPUExecutionProvider;
         use ort::session::builder::GraphOptimizationLevel;
@@ -227,6 +242,22 @@ impl ModelConfig {
                 ort::ep::NNAPI::default().build(),
                 CPUExecutionProvider::default().build().error_on_failure(),
             ])?,
+
+            #[cfg(feature = "vitisai")]
+            ExecutionProvider::VitisAI => {
+                use ort::ep::ArbitrarilyConfigurableExecutionProvider;
+                let vitis = self
+                    .vitisai_options
+                    .iter()
+                    .fold(ort::ep::Vitis::default(), |ep, (key, value)| {
+                        ep.with_arbitrary_config(key, value)
+                    });
+                // Fail loudly rather than silently running the NPU export on the CPU.
+                builder.with_execution_providers([
+                    vitis.build().error_on_failure(),
+                    CPUExecutionProvider::default().build().error_on_failure(),
+                ])?
+            }
         };
 
         if let Some(configure) = self.configure.as_ref() {
